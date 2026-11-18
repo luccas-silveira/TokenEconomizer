@@ -35,7 +35,7 @@ def claude_home(tmp_path):
 
 @pytest.fixture
 def env(tmp_path, claude_home):
-    """A person who turned the import on (`history_import` is off by default)."""
+    """A person with the import on (`history_import`, on by default, set explicitly)."""
     return {"TOKENECONOMIZER_HOME": str(tmp_path / "home"), "TE_FOLD_SYNC": "1",
             "TE_HISTORY_IMPORT": "on",
             "TE_TOOLPRUNE_QUIET_MINUTES": "0", "TE_MICROSKILLS": "envfacts",
@@ -201,22 +201,19 @@ def test_history_import_off_reads_nothing_and_the_newest_are_kept(env, repo, cla
     assert doc["over_limit"] == 2 and doc["skipped"]["too_old"] == 1
 
 
-def test_by_default_a_session_start_reads_no_history_and_an_import_by_hand_does(
-        env, repo, claude_home, tmp_path, monkeypatch, capsys):
-    """Off by default: nothing is read until the person asks, by the setting or by hand."""
-    assert load_config(str(tmp_path / "empty"), env={}).history_import is False
+def test_by_default_a_session_start_reads_the_repositorys_history(env, repo, claude_home,
+                                                                  tmp_path):
+    """On by default: the first session start reads what came before, with no setting at all;
+    `TE_HISTORY_IMPORT=off` still turns it off."""
+    assert load_config(str(tmp_path / "empty"), env={}).history_import is True
+    assert load_config(str(tmp_path / "empty"),
+                       env={"TE_HISTORY_IMPORT": "off"}).history_import is False
     for i in range(2):
         history_log(claude_home, repo, f"old{i}", trap(repo, i), age_s=3600 * (10 - i))
     default = {k: v for k, v in env.items() if k != "TE_HISTORY_IMPORT"}
     start_hook(default, repo, "a", tmp_path)
     st = store_for(env, repo)
-    assert st.read("history.json") is None and not st.read("folded.json")
-
-    for k, v in default.items():
-        monkeypatch.setenv(k, v)
-    monkeypatch.delenv("TE_HISTORY_IMPORT", raising=False)
-    assert cli.main(["--cwd", repo, "--host", "claude", "history", "import"]) == 0
-    assert "imported 2 earlier session(s)" in capsys.readouterr().out
+    assert st.read("history.json") is not None
     assert ledger_ids(st) == ["old0", "old1"]
 
 
@@ -775,6 +772,44 @@ def test_the_history_settings(tmp_path):
                                                   for w in cfg.warnings)
     view = cli._config_view(load_config(str(root), env={}))
     assert view["history"]["state"] == "off" and view["history"]["history_dirs"] == ["/a", "/b"]
+
+
+def test_history_propose_sessions_is_12_by_default_and_0_turns_the_model_off(tmp_path):
+    empty = str(tmp_path / "empty")
+    assert load_config(empty, env={}).history_propose_sessions == 12
+    cfg = load_config(empty, env={"TE_HISTORY_PROPOSE_SESSIONS": "0"})
+    assert cfg.history_propose_sessions == 0
+    assert not any("history_propose_sessions" in w for w in cfg.warnings)
+    assert load_config(empty, env={"TE_HISTORY_PROPOSE_SESSIONS": "3"}
+                       ).history_propose_sessions == 3
+
+
+@pytest.mark.parametrize("bad", ["-1", "many", "2.5"])
+def test_a_bad_history_propose_sessions_is_refused_and_the_default_kept(tmp_path, bad):
+    cfg = load_config(str(tmp_path / "empty"), env={"TE_HISTORY_PROPOSE_SESSIONS": bad})
+    assert cfg.history_propose_sessions == 12
+    assert any("history_propose_sessions" in w for w in cfg.warnings)
+
+
+def test_te_config_sets_history_propose_sessions_shows_it_and_refuses_bad_values(
+        env, repo, monkeypatch, capsys):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    te = ["--cwd", repo, "--host", "claude", "config"]
+    assert cli.main(te + ["set", "history_propose_sessions=5"]) == 0
+    assert ctx_for(env, repo).config.history_propose_sessions == 5
+    capsys.readouterr()
+    assert cli.main(te + ["show"]) == 0
+    view = json.loads(capsys.readouterr().out)
+    assert view["history"]["history_propose_sessions"] == 5
+    assert "history_propose_sessions" not in view["other"]
+
+    for bad in ("-1", "many"):
+        assert cli.main(te + ["set", f"history_propose_sessions={bad}"]) == 2
+        assert "rejected" in capsys.readouterr().out
+        assert ctx_for(env, repo).config.history_propose_sessions == 5
+    assert cli.main(te + ["set", "history_propose_sessions=0"]) == 0
+    assert ctx_for(env, repo).config.history_propose_sessions == 0
 
 
 def test_where_claude_code_keeps_its_logs(tmp_path):
