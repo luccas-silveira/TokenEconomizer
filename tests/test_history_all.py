@@ -605,3 +605,404 @@ def test_the_whole_runs_detached_process_logs_to_history_all_log_in_the_state_ro
     assert out == err == log and os.path.exists(log)
     assert kw.get("cwd") == a
     assert not os.path.exists(store_for(env, a).path("history.log"))
+
+
+# ---- the first session start after installing: `history_all.maybe_start` ----------------------
+# A session start of Claude Code starts the whole run when there is none yet, resumes one left
+# `partial`, and takes over one whose heartbeat is old: inline under `TE_FOLD_SYNC=1`, else in a
+# detached `te history import --all --auto`. The detached processes are recorded, not started:
+# every `te ...` the hook would run is `subprocess.Popen` of `tokeneconomizer.plugin.cli`.
+from test_droid import TEST_CALLS, _write_session  # noqa: E402
+from test_history_import import CLAIM, detached, start_hook  # noqa: E402
+from test_live_hooks import call  # noqa: E402
+from tokeneconomizer.plugin.context import LiveContext  # noqa: E402
+
+nt_spawn = pytest.mark.skipif(os.name == "nt", reason="detached processes go through winspawn")
+
+
+@pytest.fixture
+def started(monkeypatch):
+    """The argv after `-m tokeneconomizer.plugin.cli` of every `te ...` process started; any
+    other process (git) runs."""
+    procs, real = [], subprocess.Popen
+
+    class Recorded:
+        pid = 4_000_001
+
+    def popen(cmd, *a, **kw):
+        cmd = list(cmd) if isinstance(cmd, (list, tuple)) else cmd
+        if isinstance(cmd, list) and "tokeneconomizer.plugin.cli" in cmd:
+            procs.append(cmd[cmd.index("tokeneconomizer.plugin.cli") + 1:])
+            return Recorded()
+        return real(cmd, *a, **kw)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return procs
+
+
+def opt(argv, name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def whole_runs(procs):
+    """The `te history import --all --auto` processes started."""
+    return [a for a in procs if a[:4] == ["history", "import", "--all", "--auto"]]
+
+
+def repo_imports(procs):
+    """The one-repository `te history import --auto` processes started."""
+    return [a for a in procs if a[:2] == ["history", "import"] and "--all" not in a]
+
+
+def history_procs(procs):
+    return [a for a in procs if a[:1] == ["history"]]
+
+
+def run_detached(argv, env, monkeypatch):
+    """Run a recorded `te` process here, as the detached process would, in its environment."""
+    for k, v in detached(env).items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("TE_FOLD_SYNC", raising=False)
+    return cli.main(list(argv))
+
+
+def fresh(doc):
+    return time.time() - doc["heartbeat"] < 60
+
+
+def test_the_first_session_start_imports_every_repository_inline_starting_with_its_own(
+        env, claude_home, tmp_path):
+    a = with_history(claude_home, tmp_path, "alpha", 4)
+    b = with_history(claude_home, tmp_path, "beta", 3)
+    c = with_history(claude_home, tmp_path, "gamma", 2)
+    assert all_state(env) is None
+
+    start_hook(env, c, "new1", tmp_path)                       # TE_FOLD_SYNC=1: inline
+    doc = all_state(env)
+    assert doc is not None and doc["state"] == "done"
+    assert doc["queue"][0] == key(env, c)                      # the session's repository first
+    assert doc["queue"] == [key(env, r) for r in (c, a, b)]
+    assert set(doc["done"]) == {key(env, r) for r in (a, b, c)}
+    for root, n in ((a, 4), (b, 3), (c, 2)):
+        name = os.path.basename(root)
+        assert imported(env, root) == [f"{name}{i}" for i in range(n)], name
+        assert repo_state(env, root)["state"] == "done", name
+
+
+@nt_spawn
+def test_the_first_session_start_detached_starts_the_whole_run_once_from_its_repository(
+        env, claude_home, tmp_path, started, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+
+    start_hook(detached(env), b, "new1", tmp_path)
+    runs = whole_runs(started)
+    assert len(runs) == 1
+    assert opt(runs[0], "--host") == "claude" and opt(runs[0], "--cwd") == b
+    doc = all_state(env)
+    assert doc["state"] == "running" and fresh(doc)            # claimed before it was started
+
+    # Another session start meanwhile, in the same repository or another: not a second run.
+    start_hook(detached(env), b, "new2", tmp_path)
+    start_hook(detached(env), a, "new3", tmp_path)
+    assert len(whole_runs(started)) == 1
+
+    # The process it started does the work: the claim does not make it find the run busy.
+    assert run_detached(runs[0], env, monkeypatch) == 0
+    doc = all_state(env)
+    assert doc["state"] in ("done", "partial") and doc["queue"][0] == key(env, b)
+    assert set(doc["queue"]) == {key(env, a), key(env, b)}
+    assert imported(env, a) + imported(env, b) != []
+
+
+@nt_spawn
+def test_the_first_session_start_opens_one_process_not_a_second_for_its_own_repository(
+        env, claude_home, tmp_path, started, monkeypatch):
+    """The whole run starts with the session's repository, so the session start does not also
+    start that repository's own import beside it (which would leave the run `partial`)."""
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 3)
+    start_hook(detached(env), a, "new1", tmp_path)
+    runs = whole_runs(started)
+    assert len(runs) == 1
+    assert repo_imports(started) == []
+    assert repo_state(env, a) is None
+
+    assert run_detached(runs[0], env, monkeypatch) == 0
+    doc = all_state(env)
+    assert doc["state"] == "done" and doc["done"] == [key(env, a), key(env, b)]
+    assert imported(env, a) == ["alpha0", "alpha1"]
+    assert imported(env, b) == ["beta0", "beta1", "beta2"]
+
+
+@nt_spawn
+def test_a_session_start_after_the_whole_run_is_done_starts_nothing(
+        env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 1)
+    start_hook(env, a, "new1", tmp_path)                       # inline: the run is done
+    doc = all_state(env)
+    assert doc["state"] == "done"
+
+    for root, sid in ((a, "new2"), (b, "new3"), (a, "new4")):
+        start_hook(detached(env), root, sid, tmp_path)
+    assert history_procs(started) == []
+    assert all_state(env) == doc
+    assert imported(env, a) == ["alpha0", "alpha1"] and imported(env, b) == ["beta0"]
+
+
+@nt_spawn
+def test_a_session_start_resumes_a_partial_whole_run_where_it_left_off(
+        env, claude_home, tmp_path, started, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    order = [key(env, a), key(env, b)]
+    partial = {"state": "partial", "queue": order, "cwds": {order[0]: a, order[1]: b},
+               "next": 1, "done": [order[0]], "skipped": {}, "started": time.time() - 7200,
+               "heartbeat": time.time() - 3600, "pid": 4_000_000}
+    write_all_state(env, partial)
+
+    start_hook(detached(env), b, "new1", tmp_path)
+    runs = whole_runs(started)
+    assert len(runs) == 1 and opt(runs[0], "--cwd") == b
+    assert repo_imports(started) == []                         # beta is in its queue
+    doc = all_state(env)
+    assert doc["state"] == "running" and fresh(doc)
+    assert doc["queue"] == order and doc["next"] == 1 and doc["done"] == [order[0]]
+    start_hook(detached(env), a, "new2", tmp_path)
+    assert len(whole_runs(started)) == 1                       # once, not once per start
+
+    assert run_detached(runs[0], env, monkeypatch) == 0
+    assert imported(env, b) == ["beta0", "beta1"]
+    assert imported(env, a) == []                              # before `next`: not read again
+    doc = all_state(env)
+    assert doc["state"] == "done" and doc["done"] == order
+
+
+@nt_spawn
+def test_a_session_start_takes_over_a_whole_run_whose_heartbeat_is_old_and_leaves_a_live_one(
+        env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 1)
+    order = [key(env, a), key(env, b)]
+    alive = {"state": "running", "queue": order, "cwds": {order[0]: a, order[1]: b},
+             "next": 0, "done": [], "skipped": {}, "started": time.time() - 60,
+             "heartbeat": time.time() - 5, "pid": 4_000_000}
+    write_all_state(env, alive)
+    start_hook(detached(env), a, "new1", tmp_path)
+    assert history_procs(started) == []                        # alive: left to run
+    assert all_state(env) == alive
+
+    write_all_state(env, dict(alive, heartbeat=time.time() - history.HEARTBEAT_STALE_S - 1))
+    start_hook(detached(env), a, "new2", tmp_path)
+    runs = whole_runs(started)
+    assert len(runs) == 1 and opt(runs[0], "--cwd") == a
+    assert repo_imports(started) == []
+    doc = all_state(env)
+    assert doc["state"] == "running" and fresh(doc)
+    assert doc["queue"] == order and doc["next"] == 0
+    start_hook(detached(env), b, "new3", tmp_path)
+    assert len(whole_runs(started)) == 1                       # one takeover, not one per start
+
+
+@nt_spawn
+def test_while_the_whole_run_is_alive_a_repository_in_its_queue_starts_no_import_of_its_own(
+        env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    order = [key(env, a), key(env, b)]
+    alive = {"state": "running", "queue": order, "cwds": {order[0]: a, order[1]: b},
+             "next": 0, "done": [], "skipped": {}, "started": time.time() - 60,
+             "heartbeat": time.time() - 5, "pid": 4_000_000}
+    write_all_state(env, alive)
+
+    start_hook(detached(env), b, "new1", tmp_path)
+    assert history_procs(started) == []
+    assert repo_state(env, b) is None                          # not marked: the run takes it
+    assert all_state(env) == alive
+    ctx = ctx_for(detached(env), b)
+    assert history_all.covers(ctx) is True
+
+
+@nt_spawn
+def test_a_repository_the_whole_run_has_passed_imports_on_its_own_as_before(
+        env, claude_home, tmp_path, started):
+    """Only the queue from `next` on is the run's: a repository before it starts its own."""
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    order = [key(env, a), key(env, b)]
+    write_all_state(env, {"state": "running", "queue": order,
+                          "cwds": {order[0]: a, order[1]: b}, "next": 1, "done": [],
+                          "skipped": {"gone": 1}, "started": time.time() - 60,
+                          "heartbeat": time.time() - 5, "pid": 4_000_000})
+    assert history_all.covers(ctx_for(detached(env), a)) is False
+
+    start_hook(detached(env), a, "new1", tmp_path)
+    assert whole_runs(started) == []
+    own = repo_imports(started)
+    assert own == [["history", "import", "--auto", "--host", "claude", "--cwd", a]]
+    assert repo_state(env, a)["state"] == "running"
+
+
+@nt_spawn
+def test_a_repository_outside_the_whole_runs_queue_imports_on_its_own_as_before(
+        env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    new = checkout(tmp_path / "newer", "https://github.com/acme/newer.git")   # no history then
+    order = [key(env, a)]
+    write_all_state(env, {"state": "running", "queue": order, "cwds": {order[0]: a},
+                          "next": 0, "done": [], "skipped": {}, "started": time.time() - 60,
+                          "heartbeat": time.time() - 5, "pid": 4_000_000})
+    history_log(claude_home, new, "newer0", trap(new, 0))      # its first session since
+    assert history_all.covers(ctx_for(detached(env), new)) is False
+
+    start_hook(detached(env), new, "new1", tmp_path)
+    assert whole_runs(started) == []
+    assert repo_imports(started) == [["history", "import", "--auto", "--host", "claude",
+                                      "--cwd", new]]
+    assert repo_state(env, new)["state"] == "running"
+
+
+def test_a_repository_outside_a_done_whole_run_is_imported_inline_as_before(
+        env, claude_home, tmp_path):
+    a = with_history(claude_home, tmp_path, "alpha", 1)
+    start_hook(env, a, "new1", tmp_path)
+    assert all_state(env)["state"] == "done"
+    new = with_history(claude_home, tmp_path, "newer", 2)      # a checkout made afterwards
+    start_hook(env, new, "new2", tmp_path)
+    assert imported(env, new) == ["newer0", "newer1"]
+    assert repo_state(env, new)["state"] == "done"
+    assert all_state(env)["state"] == "done"
+
+
+@nt_spawn
+def test_with_history_import_off_neither_import_starts(env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 1)
+    off = dict(env, TE_HISTORY_IMPORT="off")
+
+    start_hook(detached(off), a, "new1", tmp_path)
+    start_hook(off, b, "new2", tmp_path)                       # inline as well
+    assert history_procs(started) == []
+    assert all_state(env) is None
+    assert repo_state(env, a) is None and repo_state(env, b) is None
+    assert imported(env, a) == [] and imported(env, b) == []
+
+    # A whole run left partial is not taken up while the setting is off.
+    order = [key(env, a), key(env, b)]
+    partial = {"state": "partial", "queue": order, "cwds": {order[0]: a, order[1]: b},
+               "next": 0, "done": [], "skipped": {}, "started": time.time() - 7200,
+               "heartbeat": time.time() - 3600, "pid": 4_000_000}
+    write_all_state(env, partial)
+    start_hook(detached(off), a, "new3", tmp_path)
+    assert whole_runs(started) == []
+    assert all_state(env)["state"] != "running"
+
+
+@nt_spawn
+@pytest.mark.parametrize("name", ["codex", "copilot"])
+def test_a_session_start_of_another_agent_starts_no_whole_run(name, env, claude_home, tmp_path,
+                                                               started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    t = str(tmp_path / f"{name}.jsonl")
+    open(t, "w").close()
+    for e in (env, detached(env)):
+        call(e, {"hook_event_name": "SessionStart", "session_id": f"{name}-{len(started)}",
+                 "source": "startup", "transcript_path": t, "cwd": a}, name)
+    assert history_procs(started) == []
+    assert all_state(env) is None
+    assert imported(env, a) == [] and repo_state(env, a) is None
+
+
+@nt_spawn
+def test_a_droid_session_start_starts_no_whole_run_and_imports_its_own_history_as_before(
+        env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)        # Claude Code's history too
+    sessions_dir = tmp_path / "droid-sessions"
+    _write_session(sessions_dir, "d0", a, TEST_CALLS)
+    denv = dict(detached(env), DROID_SESSIONS_DIR=str(sessions_dir))
+    # Even with a live whole run of Claude Code listing the same repository.
+    order = [key(env, a)]
+    alive = {"state": "running", "queue": order, "cwds": {order[0]: a}, "next": 0,
+             "done": [], "skipped": {}, "started": time.time() - 60,
+             "heartbeat": time.time() - 5, "pid": 4_000_000}
+    write_all_state(env, alive)
+
+    call(denv, {"hook_event_name": "SessionStart", "session_id": "d1", "source": "startup",
+                "transcript_path": str(sessions_dir / "ws" / "d1.jsonl"), "cwd": a}, "droid")
+    assert whole_runs(started) == []
+    assert repo_imports(started) == [["history", "import", "--auto", "--host", "droid",
+                                      "--cwd", a]]
+    assert store_for(env, a, host="droid").read("history.json")["state"] == "running"
+    assert all_state(env) == alive
+    assert imported(env, a) == []                              # Claude Code's: not touched
+
+
+@nt_spawn
+@pytest.mark.parametrize("name", sorted(set(hosts.HOSTS) - {"claude"}))
+def test_history_all_leaves_every_other_agent_alone(name, env, claude_home, tmp_path, started):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    ctx = LiveContext.build(hosts.HOSTS[name](), a, detached(env))
+    history_all.maybe_start(ctx)
+    assert history_procs(started) == []
+    assert all_state(env) is None
+    order = [key(env, a)]
+    write_all_state(env, {"state": "running", "queue": order, "cwds": {order[0]: a},
+                          "next": 0, "done": [], "skipped": {}, "started": time.time() - 60,
+                          "heartbeat": time.time() - 5, "pid": 4_000_000})
+    assert not history_all.covers(ctx)          # Claude Code's run never stands in for theirs
+
+
+def _learned(env, repo, tmp_path):
+    """Six sessions folded live, with the import off: the start's context carries `CLAIM`."""
+    off = dict(env, TE_HISTORY_IMPORT="off")
+    for i in range(6):
+        t = trap_session(str(tmp_path / f"s{i}.jsonl"), repo, i)
+        call(off, {"hook_event_name": "SessionStart", "session_id": f"s{i}",
+                   "source": "startup", "transcript_path": t, "cwd": repo})
+        call(off, {"hook_event_name": "SessionEnd", "session_id": f"s{i}",
+                   "transcript_path": t, "cwd": repo})
+
+
+@nt_spawn
+@pytest.mark.parametrize("where", ["run_all", "spawn"])
+def test_an_exception_in_the_whole_runs_start_never_changes_the_session_starts_output(
+        where, env, claude_home, tmp_path, started, monkeypatch):
+    a = checkout(tmp_path / "alpha", "https://github.com/acme/alpha.git")
+    _learned(env, a, tmp_path)
+    with_history(claude_home, tmp_path, "beta", 2)
+    e = env if where == "run_all" else detached(env)
+    # What the start says when neither import is started at all.
+    before = start_hook(dict(e, TE_HISTORY_IMPORT="off"), a, "n0", tmp_path)
+    assert all_state(env) is None
+
+    def boom(*args, **kw):
+        raise RuntimeError(f"boom in history_all.{where}")
+    monkeypatch.setattr(history_all, where, boom)
+    out = start_hook(e, a, "n1", tmp_path)
+    assert CLAIM in out["hookSpecificOutput"]["additionalContext"]
+    assert out["hookSpecificOutput"]["additionalContext"] == \
+        before["hookSpecificOutput"]["additionalContext"]
+    log = open(os.path.join(env["TOKENECONOMIZER_HOME"], "errors.log")).read()
+    assert f"RuntimeError: boom in history_all.{where}" in log
+
+
+def test_the_notice_is_said_once_per_repository_after_the_whole_run_imported_it(
+        env, claude_home, tmp_path):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 3)
+    said = ("TokenEconomizer read {n} earlier session(s) of {label} from Claude Code's "
+            "history.")
+    la, lb = repo_identity(a, env).label, repo_identity(b, env).label
+
+    first = start_hook(env, a, "a1", tmp_path)                 # the whole run, inline
+    assert all_state(env)["state"] == "done"
+    assert "earlier session" not in first.get("systemMessage", "")
+
+    second = start_hook(env, a, "a2", tmp_path)
+    assert said.format(n=2, label=la) in second["systemMessage"]
+    assert lb not in second["systemMessage"]
+    assert "earlier session" not in start_hook(env, a, "a3", tmp_path).get("systemMessage", "")
+
+    other = start_hook(env, b, "b1", tmp_path)                 # read by the same run
+    assert said.format(n=3, label=lb) in other["systemMessage"]
+    assert "earlier session" not in start_hook(env, b, "b2", tmp_path).get("systemMessage", "")
