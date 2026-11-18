@@ -604,11 +604,13 @@ def test_the_next_live_fold_under_auto_holds_nothing_that_rests_on_history(
 
 def test_an_import_calls_no_model_and_keeps_a_waiting_deny_list(env, repo, claude_home,
                                                                 tmp_path, monkeypatch):
+    """`history_propose_sessions=0`: no session of the import calls a model, as before."""
     for i in range(3):
         history_log(claude_home, repo, f"old{i}", trap(repo, i), age_s=3600 * (10 - i))
     asked = []
     monkeypatch.setattr(sidecall, "runner_for", lambda *a, **k: asked.append(a) or None)
-    env = dict(env, TE_MICROSKILLS="on", TE_MICROSKILLS_PROPOSE_EVERY="1")
+    env = dict(env, TE_MICROSKILLS="on", TE_MICROSKILLS_PROPOSE_EVERY="1",
+               TE_HISTORY_PROPOSE_SESSIONS="0")
     ctx = ctx_for(env, repo)
     pending = {"items": ["Workflow"], "root": repo, "since": 1.0}
     ctx.store.write("untool.json", {"auto_pending": pending})
@@ -619,6 +621,136 @@ def test_an_import_calls_no_model_and_keeps_a_waiting_deny_list(env, repo, claud
     live_session(ctx, "seen", trap_session(str(tmp_path / "seen.jsonl"), repo, 7))
     fold.fold_session(ctx, "seen")
     assert asked                                # a session the plugin saw end still may
+
+
+# ---- the fact proposer on the newest sessions of an import ----------------------------------
+def earlier_sessions(claude_home, repo, n, deferred=()):
+    """`n` earlier sessions of `repo`, `s00` the oldest, each meeting the missing `pytest`."""
+    ids = [f"s{i:02d}" for i in range(n)]
+    for i, sid in enumerate(ids):
+        history_log(claude_home, repo, sid, trap(repo, i), age_s=3600 * (n + 10 - i),
+                    deferred=deferred)
+    return ids
+
+
+def proposer_spy(monkeypatch, store, tokens=0):
+    """Stands in for the proposer's side calls. Each list holds, for every time it happened, the
+    place in the import of the session being folded (the sessions already in the ledger):
+    `agent`, a proposer runner asked of the agent's CLI (`sidecall.runner_for`); `local`, one
+    asked of the on-device model (`sidecall.local_runner`); `called`, the runner called."""
+    seen = {"agent": [], "local": [], "called": []}
+
+    def runner(prompt, model="agent"):
+        seen["called"].append(len(ledger_ids(store)))
+        return "", tokens
+
+    def asker(kind):
+        def ask(*a, role=None, **k):
+            if role is None and kind == "local" and a:
+                role = a[0]
+            if role != "proposer":
+                return None
+            seen[kind].append(len(ledger_ids(store)))
+            return runner
+        return ask
+    monkeypatch.setattr(sidecall, "runner_for", asker("agent"))
+    monkeypatch.setattr(sidecall, "local_runner", asker("local"))
+    return seen
+
+
+def paid(env):
+    """The paid profile (`on`: `envfacts+distiller`), the proposer every 3 sessions."""
+    return dict(env, TE_MICROSKILLS="on", TE_MICROSKILLS_PROPOSE_EVERY="3")
+
+
+NEWEST_CALLED = ["s08", "s11", "s14", "s17"]        # the 1st, 4th, 7th and 10th of the 12
+
+
+def test_the_fact_proposer_runs_on_the_12_newest_sessions_of_an_import_only(
+        env, repo, claude_home, monkeypatch):
+    ids = earlier_sessions(claude_home, repo, 20)
+    ctx = ctx_for(paid(env), repo)
+    assert ctx.config.history_propose_sessions == 12               # the default
+    seen = proposer_spy(monkeypatch, ctx.store)
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 20
+    assert ledger_ids(ctx.store) == ids
+    assert [ids[k] for k in seen["agent"]] == ids[8:]            # never the 8 oldest
+    assert [ids[k] for k in seen["called"]] == NEWEST_CALLED
+    assert seen["local"] == []
+
+
+def test_a_newest_session_holds_no_deny_list_and_its_ledger_record_counts_the_model(
+        env, repo, claude_home, monkeypatch):
+    _catalog(env, ["Bash", "Read", "Edit", "Write"] + UNUSED)
+    ids = earlier_sessions(claude_home, repo, 20, deferred=UNUSED)
+    ctx = ctx_for(paid(env), repo)
+    seen = proposer_spy(monkeypatch, ctx.store, tokens=500)
+    pending = {"items": ["Workflow"], "root": repo, "since": 1.0}
+    ctx.store.write("untool.json", {"auto_pending": pending})
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 20
+    assert [ids[k] for k in seen["called"]] == NEWEST_CALLED
+    recs = {r["session_id"]: r for r in ctx.store.read_lines("ledger.jsonl")
+            if r["kind"] == "session"}
+    assert list(recs) == ids
+    assert all(r["imported"] and r["untool_applied"] == [] for r in recs.values())
+    assert all(e["imported"] for e in ctx.store.read("folded.json").values())
+    assert {s: r["overhead"]["optimizer_tokens"] for s, r in recs.items()
+            if r["overhead"]["optimizer_tokens"]} == {s: 500 for s in NEWEST_CALLED}
+    assert ctx.store.read("untool.json")["auto_pending"] == pending
+    assert not os.path.exists(denylist.settings_path(repo))
+
+
+def test_without_a_paid_profile_the_newest_sessions_call_no_model_either(
+        env, repo, claude_home, monkeypatch):
+    earlier_sessions(claude_home, repo, 20)
+    env = dict(env, TE_MICROSKILLS="envfacts", TE_HISTORY_PROPOSE_SESSIONS="12",
+               TE_MICROSKILLS_PROPOSE_EVERY="1")
+    ctx = ctx_for(env, repo)
+    seen = proposer_spy(monkeypatch, ctx.store, tokens=500)
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 20
+    assert seen == {"agent": [], "local": [], "called": []}
+    assert all(r["overhead"]["optimizer_tokens"] == 0 for r in ctx.store.read_lines(
+        "ledger.jsonl"))
+
+
+def test_with_side_calls_paused_the_newest_sessions_use_the_local_runner(
+        env, repo, claude_home, monkeypatch):
+    """As a live fold does once the agent's CLI said it is not signed in."""
+    ids = earlier_sessions(claude_home, repo, 20)
+    ctx = ctx_for(paid(env), repo)
+    monkeypatch.setattr(sidecall, "paused", lambda *a, **k: {"at": 1.0})
+    seen = proposer_spy(monkeypatch, ctx.store)
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    assert history.run(ctx, auto=True)["imported"] == 20
+    assert seen["agent"] == []
+    assert [ids[k] for k in seen["local"]] == ids[8:]
+    assert [ids[k] for k in seen["called"]] == NEWEST_CALLED
+
+
+def test_a_resumed_import_counts_the_newest_over_the_whole_saved_plan(
+        env, repo, claude_home, monkeypatch):
+    ids = earlier_sessions(claude_home, repo, 20)
+    env = paid(env)
+    ctx = ctx_for(detached(env), repo)
+    seen = proposer_spy(monkeypatch, ctx.store)
+    clock = iter(range(1000))
+    monkeypatch.setattr(history, "_clock", lambda: next(clock))
+    ctx.store.write("history.json", {"state": "running", "heartbeat": time.time()})
+    res = history.run(ctx, auto=True, budget_s=6.5)
+    assert res["state"] == "partial" and res["imported"] == 6
+    doc = ctx.store.read("history.json")
+    assert doc["state"] == "partial" and doc["next"] == 6
+    assert [s["id"] for s in doc["plan"]] == ids
+    assert seen["agent"] == []          # 14 left: the 12 newest are still the plan's last 12
+
+    res = history.run(ctx_for(detached(env), repo), auto=True, budget_s=1000)
+    assert res["state"] == "done" and res["imported"] == 20
+    assert ledger_ids(ctx.store) == ids
+    assert [ids[k] for k in seen["agent"]] == ids[8:]
+    assert [ids[k] for k in seen["called"]] == NEWEST_CALLED
 
 
 def test_an_import_ignores_and_keeps_the_deny_list_in_place(env, repo, claude_home):
