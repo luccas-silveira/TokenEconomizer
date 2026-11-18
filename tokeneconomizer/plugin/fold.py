@@ -72,17 +72,19 @@ def _microskills_config(ctx, profile):
                            max_tokens=ctx.config.microskills_max_tokens)
 
 
-def _fold_microskills(ctx, adapter, run_dir, session_id, injected=None, imported=False):
+def _fold_microskills(ctx, adapter, run_dir, session_id, injected=None, imported=False,
+                      propose=False):
     profile = ctx.config.microskills
     if profile == "off":
         return None
     from tokeneconomizer.microskills import PrefixStage
     icfg = _microskills_config(ctx, profile)
     # Paused once the host's CLI said it is not signed in (`sidecall.paused`): the free layer
-    # still learns. A session read from the agent's history never calls a model: the free
-    # layer learns from it, and the proposer waits for sessions the plugin sees end.
+    # still learns. A session read from the agent's history calls no model unless it is one of
+    # the newest `history_propose_sessions` of the import (`propose`): the free layer learns
+    # from every one, and the proposer runs on those newest ones as on a live session.
     runner = None
-    if icfg.paid and not imported:
+    if icfg.paid and (not imported or propose):
         runner = (sidecall.runner_for(ctx.host.name, ctx.config, role="proposer")
                   if not sidecall.paused(ctx.host.name, ctx.root)
                   else sidecall.local_runner("proposer", ctx.config))
@@ -499,11 +501,13 @@ def fold_session(ctx, session_id, transcript_path=None):
         return fold_locked(ctx, session_id, transcript_path)
 
 
-def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None):
+def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None,
+                propose=False):
     """`fold_session` for a caller that holds the "fold" lock (the history import holds it for
     its whole run). With `imported`, the session is one from the agent's history, read once
     and only to learn from (see `history`): it is scored against the tools its own log shows,
-    no model is called, no deny rule is held, written or given back, and its ledger record and
+    no model is called, except the fact proposer when `propose` (the newest
+    `history_propose_sessions` of an import), no deny rule is held, written or given back, and its ledger record and
     `folded.json` entry say `imported`. `span` is (started, ended) for a session the plugin
     never recorded."""
     sess_name = os.path.join("sessions", f"{session_id}.json")
@@ -544,7 +548,8 @@ def fold_locked(ctx, session_id, transcript_path=None, imported=False, span=None
                                   catalog=catalog, protect=ctx.config.toolprune_protect)
             with ctx.store.locked("mechanisms"):
                 inj = _fold_microskills(ctx, adapter, run_dir, session_id,
-                                        injected=sess.get("injected_ids"), imported=imported)
+                                        injected=sess.get("injected_ids"), imported=imported,
+                                        propose=propose)
                 # A session that ran no prompt is no evidence about the tools.
                 unt = None if prompts == 0 else _fold_toolprune(
                     ctx, adapter, run_dir, session_id, transcript=transcript,

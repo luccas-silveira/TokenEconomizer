@@ -37,9 +37,11 @@ look long unused, if older sessions were folded after newer ones. So:
     `MAX_ATTEMPTS` times (`attempt`).
 
 An imported session is folded to learn from and nothing else (`fold.fold_locked(imported=True)`):
-scored against the tools its own log shows, never today's catalog; no model call; no deny rule
-held, written or given back; its ledger record and `folded.json` entry say `imported`, and `te
-status` counts it apart from the sessions the plugin ran with. Tool pruning keeps the plugin's own
+scored against the tools its own log shows, never today's catalog; no model call, except the
+fact proposer on the newest `history_propose_sessions` of the plan (`propose`), with the same
+runner a live session would use; no deny rule held, written or given back; its ledger record and
+`folded.json` entry say `imported`, and `te status` counts it apart from the sessions the plugin
+ran with. Tool pruning keeps the plugin's own
 sessions' evidence apart too, and `toolprune=auto` writes by itself only what that alone is
 enough for (`fold._fold_toolprune`). Each imported session's prompt-turns are replayed through
 the loop guard with no envelope and no judge -- it can neither redirect nor stop anything -- and
@@ -368,7 +370,7 @@ def _run_locked(ctx, doc, resuming, now, budget_s, log):
     while i < len(items):
         if _clock() >= deadline:
             break
-        _import_one(ctx, doc, items[i], skipped, log)
+        _import_one(ctx, doc, items, i, skipped, log)
         i += 1
         doc.pop("attempt", None)
         doc.update(next=i, heartbeat=time.time())
@@ -391,12 +393,15 @@ def _run_locked(ctx, doc, resuming, now, budget_s, log):
             "left": len(items) - i, "reason": None}
 
 
-def _import_one(ctx, doc, item, skipped, log):
-    """Fold one planned session, under the fold lock. `doc["attempt"]`, saved before the fold
+def _import_one(ctx, doc, items, i, skipped, log):
+    """Fold `items[i]`, one planned session, under the fold lock. The fact proposer runs on it
+    when it is among the last `history_propose_sessions` of the whole saved plan (the newest),
+    counted over the plan, not over what a resumed run has left. `doc["attempt"]`, saved before the fold
     and dropped with the place saved after it, tells a restarted run what the last one was
     doing when its process died: a session it died on `MAX_ATTEMPTS` times is left out (an
     error), so that no log can block live folds for good; one it folded before it could save
     its place is counted, and its turns replayed into the envelope."""
+    item = items[i]
     sid = item.get("id") if isinstance(item, dict) else None
     att = doc.get("attempt") if isinstance(doc.get("attempt"), dict) else {}
     tries = int(_num(att.get("n"))) if sid is not None and att.get("id") == sid else 0
@@ -421,8 +426,11 @@ def _import_one(ctx, doc, item, skipped, log):
     doc["attempt"] = {"id": sid, "n": tries + 1}
     _save(ctx, doc)
     try:
+        tail = max(0, int(ctx.config.history_propose_sessions or 0))
+        propose = tail > 0 and i >= len(items) - tail
         rec = fold.fold_locked(ctx, sid, item["path"], imported=True,
-                               span=(item.get("started"), item.get("ended")))
+                               span=(item.get("started"), item.get("ended")),
+                               propose=propose)
         if rec is not None and not rec.get("error"):
             doc["imported"] = int(_num(doc.get("imported"))) + 1
             try:
