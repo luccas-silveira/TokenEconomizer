@@ -819,6 +819,96 @@ def test_imported_sessions_are_counted_apart(env, repo, claude_home, tmp_path, m
     assert "claude 1 (+2 from earlier history)" in capsys.readouterr().out
 
 
+def test_what_reading_the_history_cost_is_counted_apart_from_the_plugins_overhead():
+    s = accounting.summarize([
+        {"kind": "session", "effective_tokens": 100.0, "requests": 2,
+         "overhead": {"optimizer_tokens": 7}},
+        {"kind": "overhead", "overhead": {"spiral_judge_tokens": 3}},
+        {"kind": "session", "effective_tokens": 900.0, "imported": True,
+         "overhead": {"optimizer_tokens": 50}},
+        {"kind": "session", "effective_tokens": 800.0, "imported": True,
+         "overhead": {"optimizer_tokens": 250}},
+        {"kind": "session", "effective_tokens": 700.0, "imported": True}])
+    assert s["imported_overhead_tokens"] == 300
+    assert s["overhead_tokens"] == 10
+    assert s["overhead_frac"] == pytest.approx(10 / 110)
+    assert s["effective_tokens"] == 100.0 and s["imported_sessions"] == 3
+
+
+def test_without_imported_sessions_nothing_was_spent_reading_the_history():
+    s = accounting.summarize([
+        {"kind": "session", "effective_tokens": 100.0, "overhead": {"optimizer_tokens": 40}},
+        {"kind": "overhead", "overhead": {"spiral_judge_tokens": 5}}])
+    assert s["imported_overhead_tokens"] == 0
+    assert s["overhead_tokens"] == 45
+    assert accounting.summarize([])["imported_overhead_tokens"] == 0
+
+
+def _status(env, repo, monkeypatch, capsys, *extra):
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    cli.main(["--cwd", repo, "--host", "claude", "status", *extra])
+    return capsys.readouterr().out
+
+
+def _line(out, label):
+    found = [ln for ln in out.splitlines() if ln.startswith(f"  {label} ")]
+    assert len(found) == 1, out
+    return found[0]
+
+
+def _imported_with_cost(env, repo, claude_home, tmp_path, spent):
+    """Two sessions read from the history, the reading of one costing `spent` tokens."""
+    for i in range(2):
+        history_log(claude_home, repo, f"old{i}", trap(repo, i), age_s=3600 * (10 - i))
+    start_hook(env, repo, "new", tmp_path)
+    st = ctx_for(env, repo).store
+    rows = st.read_lines("ledger.jsonl")
+    assert [r for r in rows if r.get("imported")]
+    if spent:
+        st.append("ledger.jsonl", {"kind": "session", "session_id": "old-paid", "imported": True,
+                                   "overhead": {"optimizer_tokens": spent}})
+    return st
+
+
+def test_status_says_what_reading_the_history_cost(env, repo, claude_home, tmp_path,
+                                                   monkeypatch, capsys):
+    spent = 54321
+    _imported_with_cost(env, repo, claude_home, tmp_path, spent)
+    out = _status(env, repo, monkeypatch, capsys)
+    hist = _line(out, "history")
+    assert "read " in hist and "earlier session(s) from Claude Code's history" in hist
+    assert accounting.fmt_tokens(spent) in hist and "reading" in hist
+    assert accounting.fmt_tokens(spent) not in _line(out, "sessions")
+    js = json.loads(_status(env, repo, monkeypatch, capsys, "--json"))
+    assert js["ledger"]["imported_overhead_tokens"] == spent
+    assert js["ledger"]["overhead_tokens"] < spent
+
+
+def test_status_history_line_is_unchanged_when_reading_it_cost_nothing(
+        env, repo, claude_home, tmp_path, monkeypatch, capsys):
+    _imported_with_cost(env, repo, claude_home, tmp_path, 0)
+    ctx = ctx_for(env, repo)
+    today = "  history      " + history.describe(history.summary(ctx), "claude")
+    out = _status(env, repo, monkeypatch, capsys)
+    assert _line(out, "history") == today
+    assert "reading" not in today
+    js = json.loads(_status(env, repo, monkeypatch, capsys, "--json"))
+    assert js["ledger"]["imported_overhead_tokens"] == 0
+
+
+def test_status_shows_the_cost_of_reading_the_history_even_without_its_state(
+        env, repo, claude_home, tmp_path, monkeypatch, capsys):
+    """`history.json` gone (an older state, a merge that did not bring it): the cost the ledger
+    holds is still shown, on a `history` line of its own."""
+    spent = 4321
+    st = _imported_with_cost(env, repo, claude_home, tmp_path, spent)
+    os.remove(st.path("history.json"))
+    assert history.describe(history.summary(ctx_for(env, repo)), "claude") is None
+    hist = _line(_status(env, repo, monkeypatch, capsys), "history")
+    assert accounting.fmt_tokens(spent) in hist and "reading" in hist
+
+
 def test_a_merge_carries_imported_sessions_along(env, repo, claude_home, tmp_path):
     history_log(claude_home, repo, "old0", trap(repo, 0))
     start_hook(env, repo, "new", tmp_path)
