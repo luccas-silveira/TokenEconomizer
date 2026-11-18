@@ -172,8 +172,12 @@ def _headless(head, prompts):
     return prompts <= 1 and str(head.get("entrypoint") or "").lower().startswith("sdk")
 
 
-def plan(ctx, now=None):
+def plan(ctx, now=None, logs=None):
     """What an import would fold here, and why the rest is left out; reads, never writes.
+
+    `logs`, when given, are the logs to choose from in place of the host's history, each with
+    the head already read (`history_all.discover`'s groups): neither is read again. Each is
+    still checked to be this repository's.
 
     Returns {"sessions": [{"id", "path", "started", "ended"}] oldest first, "skipped": {why: n},
     "over_limit": n}."""
@@ -184,8 +188,9 @@ def plan(ctx, now=None):
 
     def skip(why):
         skipped[why] = skipped.get(why, 0) + 1
-    for log in ctx.host.history(ctx.env, cfg.history_dirs):
-        head = ctx.host.log_head(log["path"])
+    listed = ctx.host.history(ctx.env, cfg.history_dirs) if logs is None else logs
+    for log in listed:
+        head = ctx.host.log_head(log["path"]) if logs is None else log["head"]
         if not is_this_repository(ctx, log["folder"], head.get("cwd"), cache):
             continue
         sid = ctx.host.safe_session_id(log["session_id"])
