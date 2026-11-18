@@ -642,6 +642,7 @@ def _config_view(cfg):
                     "history_import": d.pop("history_import"),
                     "history_max_sessions": d.pop("history_max_sessions"),
                     "history_days": d.pop("history_days"),
+                    "history_propose_sessions": d.pop("history_propose_sessions"),
                     "history_dirs": d.pop("history_dirs")},
         "droid": {"state": "on" if cfg.droid_sidecall else "off",
                   "droid_sidecall": d.pop("droid_sidecall")},

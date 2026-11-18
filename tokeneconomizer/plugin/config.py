@@ -70,11 +70,13 @@ person can tune by hand:
                                    is off by default: `microskills=envfacts` learns without it;
   * history_import              -- on Claude Code, fold a repository's sessions from before the
                                    plugin (Claude Code's own logs) once, at its first session
-                                   start, when nothing is folded there yet. Off by default:
-                                   the plugin learns only from sessions it sees end, and
+                                   start, when nothing is folded there yet. On by default;
                                    `te history import` reads them by hand;
   * history_max_sessions, history_days -- the newest sessions that import takes, and how far
                                    back it reads;
+  * history_propose_sessions    -- of an import's sessions, the newest this many may run the
+                                   fact proposer (micro-skills with a paid profile only); 0
+                                   calls no model while importing;
   * history_dirs                -- further Claude Code `projects` folders to read, beside
                                    `$CLAUDE_CONFIG_DIR/projects` (else `~/.claude/projects`).
 
@@ -216,9 +218,10 @@ class LiveConfig:
     pi_cli: str = ""
     hermes_cli: str = ""
     droid_sidecall: bool = False
-    history_import: bool = False
+    history_import: bool = True
     history_max_sessions: int = 200
     history_days: int = 365
+    history_propose_sessions: int = 12
     history_dirs: list = field(default_factory=list)
     shadow: bool = False
     vocabulary: str = "auto"
@@ -234,7 +237,7 @@ class LiveConfig:
                 "codex_paid_effort": ("", "none", "minimal", "low", "medium", "high", "xhigh",
                                       "max")}
     # The smallest value a number setting takes, where it is not 1.
-    _MIN = {"toolprune_quiet_minutes": 0}
+    _MIN = {"toolprune_quiet_minutes": 0, "history_propose_sessions": 0}
 
     def as_dict(self):
         d = asdict(self)
@@ -362,7 +365,8 @@ _ENV = {"TE_MODE": "mode", "TE_SHADOW": "shadow",
         "TE_PI_EXTENSIONS": "pi_extensions", "TE_PI_CLI": "pi_cli",
         "TE_HERMES_CLI": "hermes_cli",
         "TE_HISTORY_IMPORT": "history_import", "TE_HISTORY_MAX_SESSIONS": "history_max_sessions",
-        "TE_HISTORY_DAYS": "history_days", "TE_HISTORY_DIRS": "history_dirs"}
+        "TE_HISTORY_DAYS": "history_days", "TE_HISTORY_DIRS": "history_dirs",
+        "TE_HISTORY_PROPOSE_SESSIONS": "history_propose_sessions"}
 _ENV_THRESHOLDS = ("TE_SPIRAL_THRESHOLDS", "TE_LOOPGUARD_THRESHOLDS")
 
 
