@@ -306,12 +306,13 @@ def _say(log, text):
             pass
 
 
-def run(ctx, auto=False, now=None, budget_s=BUDGET_S, log=None):
+def run(ctx, auto=False, now=None, budget_s=BUDGET_S, log=None, logs=None):
     """Import this repository's earlier sessions, holding the fold lock throughout.
 
     `auto`: started by a session start, which imports only into a store with nothing folded and
     records a skip otherwise; by hand (`te history import`), a refusal changes nothing that is
-    recorded but a store never imported into. Returns {"state", "imported", "skipped",
+    recorded but a store never imported into. `logs`: the logs a new plan chooses from (`plan`),
+    when the caller has already read them. Returns {"state", "imported", "skipped",
     "reason"}: state "busy" when the fold lock stayed taken, "refused" when the import may not
     run here."""
     now = time.time() if now is None else now
@@ -341,7 +342,7 @@ def run(ctx, auto=False, now=None, budget_s=BUDGET_S, log=None):
                                 state="skipped", reason=why, at=time.time()))
             return {"state": "refused" if not auto else "skipped", "reason": why}
         try:
-            return _run_locked(ctx, doc, resuming, now, budget_s, log)
+            return _run_locked(ctx, doc, resuming, now, budget_s, log, logs)
         except Exception:
             # Not left `running`: live folds would wait for a run that fails again each time.
             _record_error(ctx.root)
@@ -352,14 +353,14 @@ def run(ctx, auto=False, now=None, budget_s=BUDGET_S, log=None):
             return {"state": "error", "reason": doc["reason"]}
 
 
-def _run_locked(ctx, doc, resuming, now, budget_s, log):
+def _run_locked(ctx, doc, resuming, now, budget_s, log, logs=None):
     """`run` once it may go on, under the fold lock: plan (or take up the saved plan), fold
     each session in order, save the place after each, then fold the sessions left pending."""
     if not resuming:
         # Live folds wait from now on, while the plan is made, not only once it is.
         _save(ctx, {k: v for k, v in dict(doc, state="running",
                                           heartbeat=time.time()).items() if k != "plan"})
-        p = plan(ctx, now)
+        p = plan(ctx, now, logs=logs)
         doc = {"state": "running", "plan": p["sessions"], "next": 0, "imported": 0,
                "skipped": p["skipped"], "over_limit": p["over_limit"],
                "planned": len(p["sessions"]), "started": time.time(), "noticed": False}

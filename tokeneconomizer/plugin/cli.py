@@ -28,6 +28,11 @@
                                       no deny list written; only before any session is folded;
                                       with `history_import=on`, the first session start runs
                                       it by itself)
+    te history import --all [--dry-run]
+                                      the same for every repository in the agent's history,
+                                      one after another (`--dry-run`: each one's sessions to
+                                      read); a run stopped by its time budget resumes where
+                                      it stopped
     te history [import --status]      what that import did here
     te repos                          every repository with state here: how it was identified,
                                       its agents and sessions, the checkouts seen
@@ -731,6 +736,9 @@ def _print_history(ctx, doc):
 
 def cmd_history(args):
     """`te history [import]`: a repository's sessions from before the plugin."""
+    if args.action == "import" and args.all_repos:
+        from . import history_all
+        return history_all.cli(args)
     ctx = _ctx(args)
     if args.action == "status" or args.status:
         _print_history(ctx, history.summary(ctx))
@@ -1041,6 +1049,8 @@ def build_parser():
     p.add_argument("--dry-run", action="store_true",
                    help="say what would be imported, change nothing")
     p.add_argument("--status", action="store_true", help="what the import did here")
+    p.add_argument("--all", dest="all_repos", action="store_true",
+                   help="every repository in the agent's history, one after another")
     p.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_history)
     p = add("repomap")
