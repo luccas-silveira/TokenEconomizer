@@ -145,9 +145,16 @@ POWERSHELL_ENV = ("PSMODULEANALYSISCACHEPATH",)
 
 
 def _hook_env(tmp_path, **extra):
+    """The hook's environment, built by hand, so it keeps none of conftest's `_no_real_history`:
+    its own empty home and Claude Code config folder, or a first session start would import
+    this machine's whole `~/.claude/projects`."""
     env = {k: os.environ[k] for k in WINDOWS_ENV if os.name == "nt" and k in os.environ}
+    user = tmp_path / "user"
+    (user / ".claude").mkdir(parents=True, exist_ok=True)
     env.update({"PATH": os.environ.get("PATH", ""), "TOKENECONOMIZER_HOME": str(tmp_path / "home"),
-                "GIT_CEILING_DIRECTORIES": str(tmp_path), "TE_FOLD_SYNC": "1"})
+                "GIT_CEILING_DIRECTORIES": str(tmp_path), "TE_FOLD_SYNC": "1",
+                "HOME": str(user), "USERPROFILE": str(user),
+                "CLAUDE_CONFIG_DIR": str(user / ".claude")})
     env.update(extra)
     return env
 

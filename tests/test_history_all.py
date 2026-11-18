@@ -823,6 +823,42 @@ def test_while_the_whole_run_is_alive_a_repository_in_its_queue_starts_no_import
     assert history_all.covers(ctx) is True
 
 
+def test_a_live_session_that_ends_in_a_repository_still_ahead_in_the_whole_runs_queue_waits_for_its_import(
+        env, claude_home, tmp_path):
+    """A repository the live whole run has yet to reach has no `history.json` of its own: a
+    session of it that ends meanwhile is left pending, as under its own running import. Folded
+    then, the run would find the repository already learning and skip its earlier sessions."""
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    order = [key(env, a), key(env, b)]
+    alive = {"state": "running", "queue": order, "cwds": {order[0]: a, order[1]: b},
+             "next": 0, "done": [], "skipped": {}, "started": time.time() - 60,
+             "heartbeat": time.time() - 5, "pid": 4_000_000}
+    write_all_state(env, alive)
+
+    t = trap_session(str(tmp_path / "live1.jsonl"), b, 7)
+    call(env, {"hook_event_name": "SessionStart", "session_id": "live1", "source": "startup",
+               "transcript_path": t, "cwd": b})
+    assert repo_state(env, b) is None                          # the whole run takes it
+    call(env, {"hook_event_name": "SessionEnd", "session_id": "live1", "transcript_path": t,
+               "cwd": b})
+    assert imported(env, b) == []                              # not learned before its history
+    assert fold.pending_sessions(ctx_for(env, b)) == ["live1"]
+
+    # The whole run goes on (here: a run that takes it over, from the same `next`).
+    write_all_state(env, dict(alive, heartbeat=time.time() - history.HEARTBEAT_STALE_S - 1))
+    res = history_all.run_all(hosts.ClaudeCode(), env, auto=True)
+    assert res["state"] == "done"
+    doc = repo_state(env, b)
+    assert doc["state"] == "done", doc
+    assert imported(env, b) == ["beta0", "beta1", "live1"]     # its history first, then the live one
+    folded = store_for(env, b).read("folded.json")
+    assert folded["beta0"].get("imported") and folded["beta1"].get("imported")
+    assert not folded["live1"].get("imported")
+    assert imported(env, a) == ["alpha0", "alpha1"]
+    assert all_state(env)["done"] == order
+
+
 @nt_spawn
 def test_a_repository_the_whole_run_has_passed_imports_on_its_own_as_before(
         env, claude_home, tmp_path, started):
