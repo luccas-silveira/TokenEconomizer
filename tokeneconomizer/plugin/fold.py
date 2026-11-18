@@ -482,9 +482,20 @@ HISTORY_BLOCKING = ("running", "partial")
 
 
 def import_blocks(ctx):
-    """Is an import of earlier sessions under way here, so that a live fold must wait?"""
+    """Is an import of earlier sessions under way here, so that a live fold must wait? Either
+    this repository's own (`history.json` running or partial), or -- while it has no
+    `history.json` yet -- a live whole run that still has it ahead in its queue
+    (`history_all.covers`): folded before the run reaches it, the run would find it already
+    learning and skip its earlier sessions. An error reading the whole run's state does not
+    block (else a broken file would hold every fold here for good)."""
     doc = ctx.store.read(HISTORY)
-    return isinstance(doc, dict) and doc.get("state") in HISTORY_BLOCKING
+    if doc is not None:
+        return isinstance(doc, dict) and doc.get("state") in HISTORY_BLOCKING
+    from . import history_all   # imports history, which imports this module
+    try:
+        return bool(history_all.covers(ctx))
+    except Exception:
+        return False
 
 
 def fold_session(ctx, session_id, transcript_path=None):

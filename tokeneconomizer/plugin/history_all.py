@@ -133,16 +133,23 @@ def _take(store, auto, on):
         doc = store.read(STATE)
         doc = doc if isinstance(doc, dict) else {}
         now = time.time()
-        if doc.get("state") == "running" and not history._stale(doc, now):
+        if doc.get("state") == "running" and not history._stale(doc, now) \
+                and not (auto and _claimed(doc)):
             return {"state": "busy"}
         if auto and not on:
             doc.update(state="stopped", reason="history_import is off", at=now)
             store.write(STATE, doc)
             return {"state": "stopped"}
         doc["prev"] = doc.get("state")
+        doc.pop("claimed", None)
         doc.update(state="running", heartbeat=now, pid=os.getpid())
         store.write(STATE, {k: v for k, v in doc.items() if k != "prev"})
         return doc
+
+
+def _claimed(doc):
+    """A run `maybe_start` claimed for the process it starts, which no process has taken yet."""
+    return doc.get("claimed") is True and "pid" not in doc
 
 
 def _mark(ctx, auto, now):
@@ -392,3 +399,53 @@ def spawn(host, env, first_cwd):
     finally:
         out.close()
     return True
+
+
+# ---- the first session start after installing -----------------------------------------------
+def _alive(doc, now):
+    return doc.get("state") in ("running", "partial") and not history._stale(doc, now)
+
+
+def maybe_start(ctx, now=None):
+    """At a session start of Claude Code: start the whole run when there is none yet, resume one
+    left `partial`, or take over one whose process died -- from the session's repository, in a
+    detached `te history import --all --auto` (inline when TE_FOLD_SYNC=1, for tests).
+
+    The run is claimed here (`running`, a fresh heartbeat, `claimed` and no `pid`) so that
+    another session start meanwhile starts no second one; the process started takes the claim
+    (`_take`), and one that never does leaves it to go stale and be taken over."""
+    if ctx.host.name != "claude" or not ctx.config.history_import:
+        return None
+    now = time.time() if now is None else now
+    store = Store(ctx.root)
+    with store.locked(LOCK, timeout=history.HISTORY_LOCK_S) as got:
+        if not got:
+            return None
+        doc = store.read(STATE)
+        doc = doc if isinstance(doc, dict) else {}      # as `_take` reads it
+        state = doc.get("state")
+        if state is not None and not (state == "partial"
+                                      or (state == "running" and history._stale(doc, now))):
+            return None
+        doc.pop("pid", None)
+        doc.update(state="running", heartbeat=now, claimed=True)
+        store.write(STATE, doc)
+    if ctx.env.get("TE_FOLD_SYNC") == "1":
+        return run_all(ctx.host, ctx.env, first_cwd=ctx.repo.root, auto=True)
+    return spawn(ctx.host, ctx.env, ctx.repo.root)
+
+
+def covers(ctx, now=None):
+    """Does a live whole run stand in for this repository's own import: its queue from `next`
+    lists it, or it was just claimed and has no queue yet (it lists every repository in the
+    history, the session's first)."""
+    if ctx.host.name != "claude":
+        return False
+    doc = Store(ctx.root).read(STATE)
+    if not isinstance(doc, dict) or not _alive(doc, time.time() if now is None else now):
+        return False
+    queue = doc.get("queue")
+    if not isinstance(queue, list) or not queue:
+        return doc.get("state") == "running"
+    return ctx.repo.key in queue[int(history._num(doc.get("next"))):]
+

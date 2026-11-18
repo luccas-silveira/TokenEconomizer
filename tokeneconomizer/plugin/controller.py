@@ -28,7 +28,7 @@ import time
 import traceback
 
 from .. import loopguard
-from . import denylist, fold, history, hookqueue, repomap, repos, sidecall
+from . import denylist, fold, history, history_all, hookqueue, repomap, repos, sidecall
 from .hosts import merge_outputs
 from .paths import ensure_launcher
 
@@ -190,7 +190,11 @@ class LiveController:
         repos.prune_pins(self.ctx.root, self.host.name)
         repos.start_migration(self.ctx)
         try:
-            history.maybe_start(self.ctx)
+            history_all.maybe_start(self.ctx)
+        except Exception:
+            self._record_error()
+        try:
+            history.maybe_start(self.ctx, covered=history_all.covers(self.ctx))
         except Exception:
             self._record_error()
         # Not while an import of earlier sessions runs: it folds these once it is done.

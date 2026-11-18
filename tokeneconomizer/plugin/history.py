@@ -452,11 +452,13 @@ def _import_one(ctx, doc, items, i, skipped, log):
 
 
 # ---- what a session start does ---------------------------------------------------------------
-def maybe_start(ctx, now=None):
+def maybe_start(ctx, now=None, covered=False):
     """At a session start: start the import, resume one stopped by its budget, or restart one
     whose process died -- in a detached `te history import` (inline when TE_FOLD_SYNC=1, for
     tests). Reads only `history.json`, and `folded.json` and the ledger (when it is not empty)
-    when there is no `history.json` yet. A store with folded sessions records the skip, once."""
+    when there is no `history.json` yet. A store with folded sessions records the skip, once.
+    `covered`: a live run over the whole history (`history_all.covers`) imports this
+    repository, so nothing is started or marked here; only the skip and the stop are recorded."""
     if not getattr(ctx.host, "keeps_history", False):
         return None
     now = time.time() if now is None else now
@@ -476,11 +478,15 @@ def maybe_start(ctx, now=None):
                 doc.update(state="skipped", at=now,
                            reason=f"{ctx.repo.label} already had folded sessions")
                 return None
+            if covered:
+                return False
             doc.update(state="running", started=now, heartbeat=now, noticed=False)
         elif state == "partial" or (state == "running" and _stale(doc, now)):
             if not ctx.config.history_import:
                 doc.update(state="stopped", reason="history_import is off", at=now)
                 return None
+            if covered:
+                return False
             doc["heartbeat"] = now      # so that another session start does not start one too
         else:
             return False
