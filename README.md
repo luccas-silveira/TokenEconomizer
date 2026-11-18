@@ -410,13 +410,18 @@ repository have been idle for *q* minutes (or, at the latest, a day after the li
 conversation resumed after its tools change must write its whole history to the prompt cache again
 instead of reading it, and after an idle hour that cache has expired anyway.
 
-On Claude Code, the plugin can also learn from a repository's earlier sessions, read from Claude
-Code's own logs oldest first and without any model call. This is off by default, and a
-repository's history is read only before the plugin has learned from any session there, so turn
-it on right after installing: with `config set history_import=on --global`, the first session in
-each repository reads that repository's earlier sessions in the background (see [Earlier
-sessions](plugin/README.md#earlier-sessions)). A deny list that rests on those earlier sessions
-waits for `toolprune apply`, even under `auto`.
+On Claude Code, the plugin also learns from the sessions you ran before installing it, read from
+Claude Code's own logs, oldest first. This is on by default; `config set history_import=off
+--global` turns it off. The first Claude Code session after installing starts one background
+process that reads the history of every repository under `~/.claude/projects` (or
+`CLAUDE_CONFIG_DIR`, and `history_dirs`): the session's repository first, then from the one with
+the most sessions to the one with the fewest. A repository's history is read only before the
+plugin has learned from any session there. The import itself calls no model, except that in the
+newest `history_propose_sessions` (default 12) sessions of each repository it imports, the
+micro-skills fact proposer runs at its usual pace when micro-skills is on with the proposer
+(`0` calls no model); what that spent is shown in `te status`. `te history import --all
+[--dry-run]` runs the same by hand (see [Earlier sessions](plugin/README.md#earlier-sessions)).
+A deny list that rests on those earlier sessions waits for `toolprune apply`, even under `auto`.
 
 Besides `on` and `off`, two modes are useful: `toolprune=propose` only proposes the deny list, and
 nothing changes until you run `toolprune apply`; `microskills=envfacts` learns facts only from

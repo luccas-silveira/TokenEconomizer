@@ -13,7 +13,7 @@ the hooks run) and `plugin/` (the packaging for each agent). To install and use 
 
 | Hook | What the plugin does | Mechanism it drives |
 |---|---|---|
-| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; on Claude Code with `history_import` on, the first time in a repository with nothing folded, starts a detached `te history import` of its sessions from before the plugin, and says once when that is done | microskills |
+| `SessionStart` | Injects the repository's micro-skills (a cached render) as `additionalContext`, at a new start, and on a Copilot resume the text that session started with (§3); announces changed facts, tools the deny list newly left out, or, under `toolprune=propose` (or when `auto` could not write the file), a proposal still waiting, each in one `systemMessage` line; folds any earlier session whose end was never seen; on Claude Code with `history_import` on (the default), at the first session start after installing, starts a detached `te history import --all` over every repository's sessions from before the plugin (and resumes it, or takes it over, while it is unfinished); the first time in a repository with nothing folded that this run does not cover, a detached `te history import` of that repository alone; says once when a repository's import is done | microskills |
 | `UserPromptSubmit` | Opens a prompt-turn for the loop guard | loopguard |
 | `PostToolUse` | Folds the call into the turn's guard; delivers a redirect as `additionalContext`, then, if the turn is still stuck, a one-line notice to the person (on Claude Code, also as context asking the model to repeat it); never stops the turn | loopguard |
 | `PostToolUseFailure` | The same, for a call that failed (Claude Code and Copilot report a failed call only here); the answer names this event, as Claude Code requires | loopguard |
@@ -44,13 +44,24 @@ re-tuned. Three things it adds:
   the hook. The hook starts the job and returns; a later PostToolUse picks up the verdict, with
   the redirect already written. Each job's spend is charged to the ledger when it is spent.
 
-**Earlier sessions** (`plugin/history.py`). Claude Code keeps every session's log, so the
-sessions a repository ran before the plugin was installed can be folded too: `te history
-import`, which the first session start in a repository runs by itself when `history_import` is
-on (it is off by default). Which
-logs are the repository's is decided as for a live session, by `repo_identity` of the directory
-each log records; where that directory is gone, by an exact match of the log's folder with the
-one Claude Code derives from the repository's root. A log written in the last ten minutes, one
+**Earlier sessions** (`plugin/history.py`, `plugin/history_all.py`). Claude Code keeps every
+session's log, so the sessions a repository ran before the plugin was installed can be folded
+too: `te history import` for one repository, `te history import --all` for every one. With
+`history_import` on (the default; `config set history_import=off --global` turns it off), the
+first Claude Code session start after installing runs the second by itself, in one detached
+process: it lists every log under `~/.claude/projects/` (or `CLAUDE_CONFIG_DIR`, and
+`history_dirs`) once, groups them by repository, and imports the repositories one at a time,
+the session's own first, then from the one with the most sessions to the one with the fewest.
+Which logs are a repository's is decided as for a live session, by `repo_identity` of the
+directory each log records; where that directory is gone, by an exact match of the log's folder
+with the one Claude Code derives from a live repository's root, and a log that matches none is
+left out. The run's state is `~/.tokeneconomizer/history-all.json` and its output
+`history-all.log`; a run stopped by its time budget resumes at the next session start, and one
+whose heartbeat went stale is taken over. While a repository is still ahead in its queue, a
+session that ends there stays unfolded until the run has imported it. A repository with nothing
+folded that the run does not cover gets its own `te history import` at its first session start.
+`te history import --all --dry-run` lists the repositories and their sessions without folding.
+Within a repository, a log written in the last ten minutes, one
 already folded or recorded by the plugin's hooks, one with no prompt, one over 256 MB, one older
 than `history_days`, and a one-prompt SDK run (`claude -p`) are left out, and the newest
 `history_max_sessions` are folded, oldest first. Folding treats each session as the newest so
@@ -61,8 +72,12 @@ ends stays unfolded and is folded after it; a run stopped by its 30-minute budge
 plan it saved, in order, and one whose heartbeat went stale is restarted by the next session
 start. A session whose fold fails, or that the import's process died on twice, is left out. An
 imported session is folded only to learn from: against the tools its own log shows
-(never today's catalog), with no model call, no deny rule held, written or given back, and a
-ledger record marked `imported` that `te status` and `te repos` count apart. Its turns are
+(never today's catalog), with no deny rule held, written or given back, and a
+ledger record marked `imported` that `te status` and `te repos` count apart. It calls no model,
+except that on the newest `history_propose_sessions` (default 12; `0`: none) of a repository's
+import the micro-skills fact proposer runs at its usual pace (every `microskills_propose_every`
+sessions), only when micro-skills is on with the proposer; `te status` shows what those calls
+spent apart from the plugin's other spend. Its turns are
 replayed through the loop guard with no envelope and no judge, and those that ended green seed
 the envelope. Under `toolprune=auto`, a later fold holds a deny list by itself only where the
 plugin's own sessions alone are enough evidence (`untool.json` counts them apart); the rest waits
@@ -763,10 +778,10 @@ Which repository a session belongs to (`plugin/paths.py`, `plugin/repos.py`):
   hand, for state whose checkouts are gone.
 
 Besides the logs of the sessions whose hooks it sees, the plugin reads Claude Code's own logs
-once per repository, for the import of its earlier sessions (with `history_import` on, or `te
-history import`; off by default):
-the head of each log under `~/.claude/projects/` (or `CLAUDE_CONFIG_DIR`, and `history_dirs`), to
-tell which are the repository's, and those in full.
+for the import of earlier sessions (with `history_import` on, the default, or `te history import`
+and `te history import --all`): the head of each log under `~/.claude/projects/` (or
+`CLAUDE_CONFIG_DIR`, and `history_dirs`), to tell which repository each belongs to, and those it
+imports in full.
 
 The state directory, like the agents' own session logs it is derived from, is private to you:
 the plugin creates it `0700` and its files `0600`, and tightens a looser one it finds.
@@ -785,9 +800,10 @@ masked, never file contents — through your own agent CLI (`claude -p` / `codex
 `copilot -p` / `pi -p` / `opencode run` / `grok -p` / `hermes chat` / `droid exec`, the last only with
 `droid_sidecall` on), billed where your session is. The proposer keeps the digests of the last eight
 sessions with its state, raw commands and output capped, so that each run sees more than the
-session that just ended. Sessions imported from Claude Code's history call no model, but their
-digests join that window, so the proposer's next call can include digests of sessions from
-before the plugin.
+session that just ended. Sessions imported from Claude Code's history call no model, except the
+proposer on the newest `history_propose_sessions` of each repository's import (default 12, `0`
+for none), and their digests join that window, so the proposer's calls can include digests of
+sessions from before the plugin.
 
 The deny-list writer adds and removes only deny rules it recorded adding, never one you wrote, and
 adds a `settings.local.json` it creates to `.git/info/exclude`. A repository decides what its

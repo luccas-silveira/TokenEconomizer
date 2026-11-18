@@ -24,10 +24,11 @@
     te repomap [show | refresh]       the repository map (`repomap=on`): what is cached, or
                                       make it now
     te history import [--dry-run]     fold this repository's sessions from before the plugin,
-                                      from the agent's own logs (no model calls,
+                                      from the agent's own logs (no model calls but the
+                                      fact proposer on the newest `history_propose_sessions`;
                                       no deny list written; only before any session is folded;
-                                      with `history_import=on`, the first session start runs
-                                      it by itself)
+                                      with `history_import` on, the default, the first session
+                                      start runs it by itself)
     te history import --all [--dry-run]
                                       the same for every repository in the agent's history,
                                       one after another (`--dry-run`: each one's sessions to

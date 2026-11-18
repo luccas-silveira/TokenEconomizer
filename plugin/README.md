@@ -668,7 +668,8 @@ other hosts:
 ~/.tokeneconomizer/bin/te --host droid history import
 ```
 
-It runs only into a repository with nothing folded yet and makes no model call. Start sessions
+It runs only into a repository with nothing folded yet and calls no model, but for the fact
+proposer in the newest `history_propose_sessions` (see [Earlier sessions](#earlier-sessions)). Start sessions
 in the project's own folder: a directory that holds several repositories is learned as one.
 
 **What works.** Micro-skills, the loop guard and session cost. Droid writes each session's
@@ -755,6 +756,7 @@ repository is not used by Codex there), while settings are shared by every agent
 | `config unset KEY … [--global]` | remove the setting at this level, so the global value (or the default) applies |
 | `repomap` / `repomap refresh` | the cached repository map / make it now (see [Repository map](#repository-map)) |
 | `history` / `history import [--dry-run]` | Claude Code: what the import of this repository's earlier sessions did / run it now, or say what it would read (see [Earlier sessions](#earlier-sessions)) |
+| `history import --all [--dry-run]` | Claude Code: the same for every repository in the history, one after another, resuming where an earlier run stopped / list each repository and what it would read |
 | `repos` | every repository it keeps state for: how it was identified, its sessions per agent, the checkouts seen |
 | `repos migrate` | file state an earlier version recorded under the repository it belongs to (runs by itself, once, after an upgrade) |
 | `repos merge KEY [INTO]` | merge one repository's state into another's (default: this one), for state whose checkouts are gone |
@@ -871,28 +873,37 @@ of the preset. A value you set with `loopguard.<name>` wins over both. Defaults 
 | `repomap_timeout` | `8` | seconds the first prompt may wait for a ranked map before the cached one is used |
 
 <a id="earlier-sessions"></a>**Earlier sessions** (Claude Code). Claude Code keeps every
-session's log (`~/.claude/projects/`, or under `CLAUDE_CONFIG_DIR`). With `history_import` on
-(it is off by default), the first session start in a repository where nothing has been folded
-yet reads that repository's earlier sessions from there, in a background `te history import`,
-oldest first and each once, without any model call; `history import` does the same by hand. A log
-belongs to the repository its recorded directory is in; when that directory no longer exists,
-to the repository whose root Claude Code would file under the same folder name (an exact match).
-Left out: a log written in the last ten minutes, one the plugin already saw, one with no prompt,
-one over 256 MB, one older than `history_days`, and a one-prompt `claude -p` or SDK run. A
+session's log (`~/.claude/projects/`, or under `CLAUDE_CONFIG_DIR`). With `history_import` on,
+the default, the first Claude Code session after installing starts one background process that
+reads the earlier sessions of every repository found there (and in `history_dirs`): the
+session's repository first, then from the one with the most sessions to the one with the
+fewest, each oldest first and each session once. `config set history_import=off --global`
+turns this off. A log belongs to the repository its recorded directory is in; when that
+directory no longer exists, to the live repository whose root Claude Code would file under the
+same folder name (an exact match), and a log whose folder matches none is left out. The run
+keeps its state in `~/.tokeneconomizer/history-all.json` and its output in `history-all.log`; if
+it stops (its time budget, the machine going off), the next session start resumes it. While a
+repository is still waiting in the run's queue, a session that ends there is folded after its
+import. `history import --all` runs the same by hand, and `history import --all --dry-run` lists
+each repository and the sessions it would read; `history import` does one repository. Left
+out: a log written in the last ten minutes, one the plugin already saw, one with no prompt, one
+over 256 MB, one older than `history_days`, and a one-prompt `claude -p` or SDK run. A
 repository that already has folded sessions is not imported into (`history import` says why), so
-that earlier sessions are never learned after later ones; a session that ends during the import is
-folded after it. A deny list that rests on those earlier sessions is only proposed, even with
-`toolprune=auto`: the next session start says so, and nothing changes until you run `toolprune
-apply`. `status` counts the earlier sessions on their own. Since a repository's history is read
-only before its first session is folded, turn the import on right after installing
-(`config set history_import=on --global`), or run `history import` in a repository before its
-first session there ends.
+that earlier sessions are never learned after later ones; a session that ends during the import
+is folded after it. The import calls no model, except that in the newest
+`history_propose_sessions` sessions of each repository it imports, the micro-skills fact
+proposer runs at its usual pace (every `microskills_propose_every` sessions), only when
+micro-skills is on with the proposer (`on` or `distiller`); `0` calls no model. `status` counts
+the earlier sessions on their own, with what the import spent. A deny list that rests on those
+earlier sessions is only proposed, even with `toolprune=auto`: the next session start says so,
+and nothing changes until you run `toolprune apply`.
 
 | Key | Default | What it sets |
 |---|---|---|
-| `history_import` | `false` | `true`: a repository's first session start reads its earlier sessions |
-| `history_max_sessions` | `200` | the most recent earlier sessions read |
+| `history_import` | `true` | `false`: no session start reads earlier sessions; `history import` still does, by hand |
+| `history_max_sessions` | `200` | the most recent earlier sessions read, per repository |
 | `history_days` | `365` | how far back, in days |
+| `history_propose_sessions` | `12` | of each repository's imported sessions, the newest this many in which the fact proposer may run; `0`: none |
 | `history_dirs` | none | further Claude Code `projects` folders to read, separated by commas |
 
 **Other settings:**
