@@ -5,16 +5,20 @@ Logs are written where Claude Code keeps them (`history_log`); each names the di
 session ran in. A repository is a git checkout with an `origin`, keyed as a live session's is.
 """
 import collections
+import json
 import os
+import re
+import subprocess
 import time
 
 import pytest
 
-from test_history_import import (claude_home, ctx_for, env, history_log, looked,  # noqa: F401
-                                 trap)
+from test_history_import import (claude_home, ctx_for, env, history_log, ledger_ids,  # noqa: F401
+                                 live_session, looked, trap)
+from test_live_hooks import store_for, trap_session
 from tokeneconomizer import trace
-from tokeneconomizer.plugin import history, history_all, hosts
-from tokeneconomizer.plugin.paths import repo_identity
+from tokeneconomizer.plugin import cli, fold, history, history_all, hosts
+from tokeneconomizer.plugin.paths import repo_identity, state_root
 
 
 def checkout(path, remote):
@@ -275,3 +279,329 @@ def test_plan_from_the_passs_logs_still_leaves_out_another_repositorys(
     monkeypatch.setattr(ctx.host, "history", lambda *a, **k: pytest.fail("listed"))
     got = history.plan(ctx, logs=every)
     assert [s["id"] for s in got["sessions"]] == ["w0", "w1"]
+
+
+# ---- importing every repository: `run_all` and `te history import --all` -----------------------
+def all_state(env):
+    """`<state_root>/history-all.json`, the whole run's state; None when there is none."""
+    path = os.path.join(state_root(env), "history-all.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def write_all_state(env, doc):
+    os.makedirs(state_root(env), exist_ok=True)
+    with open(os.path.join(state_root(env), "history-all.json"), "w") as fh:
+        json.dump(doc, fh)
+
+
+def with_history(claude_home, tmp_path, name, n):
+    """A checkout of acme/<name> with `n` earlier sessions, `<name>0` the oldest."""
+    root = checkout(tmp_path / name, f"https://github.com/acme/{name}.git")
+    for i in range(n):
+        history_log(claude_home, root, f"{name}{i}", trap(root, i), age_s=3600 * (10 - i))
+    return root
+
+
+def key(env, root):
+    return repo_identity(root, env).key
+
+
+def imported(env, root):
+    """The sessions folded into `root`'s ledger, in order."""
+    return ledger_ids(store_for(env, root))
+
+
+def repo_state(env, root):
+    return store_for(env, root).read("history.json")
+
+
+def watch_runs(monkeypatch, fail=None, after=None):
+    """The repositories `history.run` is called for, in order. For the key `fail` it raises;
+    `after(ctx)` runs once each call returns (time passing while a repository is read)."""
+    calls, real = [], history.run
+
+    def run(ctx, *a, **kw):
+        calls.append(ctx.repo.key)
+        if ctx.repo.key == fail:
+            raise RuntimeError("a log this import cannot read")
+        try:
+            return real(ctx, *a, **kw)
+        finally:
+            if after:
+                after(ctx)
+    monkeypatch.setattr(history, "run", run)
+    return calls
+
+
+def test_run_all_imports_every_repository_in_the_order_of_its_queue(env, claude_home, tmp_path,
+                                                                     monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 4)
+    b = with_history(claude_home, tmp_path, "beta", 3)
+    c = with_history(claude_home, tmp_path, "gamma", 2)
+    order = [key(env, r) for r in (c, a, b)]     # the first session's repository, then by logs
+    calls = watch_runs(monkeypatch)
+
+    res = history_all.run_all(hosts.ClaudeCode(), env, first_cwd=c)
+    assert res["state"] == "done"
+    assert calls == order
+    for root, n in ((a, 4), (b, 3), (c, 2)):
+        name = os.path.basename(root)
+        assert imported(env, root) == [f"{name}{i}" for i in range(n)]
+        assert repo_state(env, root)["state"] == "done"
+    doc = all_state(env)
+    assert doc["state"] == "done" and doc["queue"] == order and doc["done"] == order
+    assert doc["cwds"] == {key(env, r): r for r in (a, b, c)}
+
+
+def test_a_repository_with_a_session_learned_live_is_skipped_and_the_run_goes_on(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)             # first in the queue
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    ctx = ctx_for(env, a)
+    live_session(ctx, "live0", trap_session(str(tmp_path / "live0.jsonl"), a, 5))
+    assert fold.fold_session(ctx, "live0") is not None
+
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert res["state"] == "done"
+    doc = repo_state(env, a)
+    assert doc["state"] == "skipped" and "already" in doc["reason"]
+    assert imported(env, a) == ["live0"]                    # its earlier sessions not read
+    assert imported(env, b) == ["beta0", "beta1"] and repo_state(env, b)["state"] == "done"
+    assert all_state(env)["state"] == "done" and key(env, b) in all_state(env)["done"]
+
+
+def test_a_repository_whose_import_is_done_skipped_or_stopped_is_not_touched(
+        env, claude_home, tmp_path, monkeypatch):
+    done = with_history(claude_home, tmp_path, "alpha", 2)
+    skipped = with_history(claude_home, tmp_path, "beta", 2)
+    stopped = with_history(claude_home, tmp_path, "gamma", 2)
+    fresh = with_history(claude_home, tmp_path, "delta", 1)
+    # A plan stopped by `history_import=off`: a manual run would resume it, a run by itself not.
+    plan = history.plan(ctx_for(env, stopped))["sessions"]
+    assert len(plan) == 2
+    before = {
+        done: {"state": "done", "imported": 7, "finished": 1.0, "noticed": True},
+        skipped: {"state": "skipped", "reason": "acme/beta already had folded sessions",
+                  "at": 1.0},
+        stopped: {"state": "stopped", "reason": "history_import is off", "at": 1.0,
+                  "plan": plan, "next": 0, "imported": 0, "skipped": {}},
+    }
+    for root, doc in before.items():
+        store_for(env, root).write("history.json", doc)
+    calls = watch_runs(monkeypatch)
+
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert res["state"] == "done"
+    for root, doc in before.items():
+        assert repo_state(env, root) == doc, os.path.basename(root)
+        assert imported(env, root) == [], os.path.basename(root)
+    assert calls == [key(env, fresh)]
+    assert imported(env, fresh) == ["delta0"]
+
+
+def test_an_error_in_one_repository_is_logged_counted_and_the_others_are_imported(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)             # first: the one that fails
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    c = with_history(claude_home, tmp_path, "gamma", 1)
+    calls = watch_runs(monkeypatch, fail=key(env, a))
+
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert calls == [key(env, r) for r in (a, b, c)]
+    assert imported(env, a) == []
+    assert imported(env, b) == ["beta0", "beta1"] and imported(env, c) == ["gamma0"]
+    doc = all_state(env)
+    assert doc["skipped"]["error"] == 1
+    assert res["state"] == doc["state"] == "done"
+    assert {key(env, b), key(env, c)} <= set(doc["done"])
+    log = open(os.path.join(env["TOKENECONOMIZER_HOME"], "errors.log")).read()
+    assert "a log this import cannot read" in log
+
+
+def test_a_run_stopped_by_the_whole_budget_resumes_at_the_next_repository(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    c = with_history(claude_home, tmp_path, "gamma", 1)
+    order = [key(env, r) for r in (a, b, c)]
+    now = [0.0]
+    monkeypatch.setattr(history, "_clock", lambda: now[0])
+    monkeypatch.setattr(history_all, "_clock", lambda: now[0], raising=False)
+
+    def ten_minutes(ctx):
+        now[0] += 600
+    calls = watch_runs(monkeypatch, after=ten_minutes)
+
+    # 15 minutes: alpha (0-10) and beta (10-20) start inside it, gamma would start after it.
+    res = history_all.run_all(hosts.ClaudeCode(), env, budget_s=900)
+    assert res["state"] == "partial"
+    assert calls == order[:2]
+    doc = all_state(env)
+    assert doc["state"] == "partial" and doc["queue"] == order
+    assert doc["next"] == 2 and doc["queue"][doc["next"]] == key(env, c)
+    assert doc["done"] == order[:2]
+    assert repo_state(env, c) is None and imported(env, c) == []    # not marked, not blocking
+    first = {r: imported(env, r) for r in (a, b)}
+    assert first == {a: ["alpha0", "alpha1", "alpha2"], b: ["beta0", "beta1"]}
+
+    del calls[:]
+    res = history_all.run_all(hosts.ClaudeCode(), env, budget_s=900)
+    assert res["state"] == "done"
+    assert calls == [key(env, c)]
+    assert {r: imported(env, r) for r in (a, b)} == first
+    assert imported(env, c) == ["gamma0"] and repo_state(env, c)["state"] == "done"
+    doc = all_state(env)
+    assert doc["state"] == "done" and doc["done"] == order
+
+
+def test_a_repository_left_partial_by_its_own_budget_is_resumed_by_the_next_run(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    ka, kb = key(env, a), key(env, b)
+    monkeypatch.setattr(history, "_clock", lambda: 0.0)          # the whole run's budget holds
+    monkeypatch.setattr(history_all, "_clock", lambda: 0.0, raising=False)
+    calls, real = [], history.run
+    cut = [True]
+
+    def run(ctx, *args, **kw):
+        calls.append(ctx.repo.key)
+        if ctx.repo.key != ka or not cut:
+            return real(ctx, *args, **kw)
+        cut.clear()
+        # alpha's own budget runs out after its first session.
+        ticks = iter([0.0, 1.0] + [1e12] * 100)
+        saved = history._clock
+        history._clock = lambda: next(ticks)
+        try:
+            return real(ctx, *args, **kw)
+        finally:
+            history._clock = saved
+    monkeypatch.setattr(history, "run", run)
+
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert calls == [ka, kb]
+    assert repo_state(env, a)["state"] == "partial" and imported(env, a) == ["alpha0"]
+    assert repo_state(env, b)["state"] == "done" and imported(env, b) == ["beta0", "beta1"]
+    doc = all_state(env)
+    assert res["state"] == doc["state"] == "partial"
+    assert ka not in doc["done"] and kb in doc["done"]
+
+    del calls[:]
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert calls == [ka]
+    assert repo_state(env, a)["state"] == "done"
+    assert imported(env, a) == ["alpha0", "alpha1", "alpha2"]
+    assert imported(env, b) == ["beta0", "beta1"]
+    doc = all_state(env)
+    assert res["state"] == doc["state"] == "done"
+    assert ka in doc["done"] and kb in doc["done"]
+
+
+def test_a_running_whole_run_is_left_alone_while_alive_and_taken_over_once_its_heartbeat_is_old(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    b = with_history(claude_home, tmp_path, "beta", 1)
+    order = [key(env, a), key(env, b)]
+    alive = {"state": "running", "queue": order, "cwds": {order[0]: a, order[1]: b}, "next": 0,
+             "done": [], "skipped": {}, "started": time.time() - 60,
+             "heartbeat": time.time() - 5, "pid": os.getpid()}
+    write_all_state(env, alive)
+    calls = watch_runs(monkeypatch)
+
+    assert history_all.run_all(hosts.ClaudeCode(), env)["state"] == "busy"
+    assert all_state(env) == alive and calls == []
+    assert repo_state(env, a) is None and repo_state(env, b) is None
+
+    dead = dict(alive, heartbeat=time.time() - history.HEARTBEAT_STALE_S - 1, pid=4_000_000)
+    write_all_state(env, dead)
+    res = history_all.run_all(hosts.ClaudeCode(), env)
+    assert res["state"] == "done" and calls == order
+    assert imported(env, a) == ["alpha0", "alpha1"] and imported(env, b) == ["beta0"]
+    doc = all_state(env)
+    assert doc["state"] == "done" and doc["done"] == order
+    assert time.time() - doc["heartbeat"] < 60
+
+
+def test_with_history_import_off_a_run_by_itself_does_nothing_and_records_stopped(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 2)
+    off = dict(env, TE_HISTORY_IMPORT="off")
+    calls = watch_runs(monkeypatch)
+
+    res = history_all.run_all(hosts.ClaudeCode(), off, auto=True)
+    assert res["state"] == "stopped"
+    assert all_state(off)["state"] == "stopped"
+    assert calls == []
+    assert repo_state(env, a) is None and imported(env, a) == []
+
+
+def _line(out, root, label, *words):
+    """The one line of `out` naming `label` (and `words`), with the label and `root` cut out."""
+    lines = [ln for ln in out.splitlines() if label in ln and all(w in ln for w in words)]
+    assert len(lines) == 1, out
+    return lines[0], lines[0].replace(root, "").replace(label, "")
+
+
+def test_te_history_import_all_dry_run_lists_each_repository_and_writes_nothing(
+        env, claude_home, tmp_path, monkeypatch, capsys):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    history_log(claude_home, str(tmp_path / "deleted"), "lost", trap(a, 9))   # gone, unmatched
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    assert cli.main(["--cwd", a, "--host", "claude", "history", "import", "--all",
+                     "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    for root, n in ((a, 3), (b, 2)):
+        line, rest = _line(out, root, repo_identity(root, env).label)
+        assert root in line                                     # the repository's directory
+        assert re.search(rf"\b{n}\b", rest), line               # its sessions to read
+    assert "left out: gone 1" in out
+    home = env["TOKENECONOMIZER_HOME"]
+    assert [os.path.join(d, f) for d, _, fs in os.walk(home) for f in fs] == []
+    assert all_state(env) is None
+
+
+def test_te_history_import_all_says_how_many_each_repository_imported(
+        env, claude_home, tmp_path, monkeypatch, capsys):
+    a = with_history(claude_home, tmp_path, "alpha", 3)
+    b = with_history(claude_home, tmp_path, "beta", 2)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    assert cli.main(["--cwd", a, "--host", "claude", "history", "import", "--all"]) == 0
+    out = capsys.readouterr().out
+    for root, n in ((a, 3), (b, 2)):
+        line, rest = _line(out, root, repo_identity(root, env).label, "imported")
+        assert re.search(rf"\b{n}\b", rest), line
+    assert imported(env, a) == ["alpha0", "alpha1", "alpha2"]
+    assert imported(env, b) == ["beta0", "beta1"]
+    assert all_state(env)["state"] == "done"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the detached process goes through winspawn there")
+def test_the_whole_runs_detached_process_logs_to_history_all_log_in_the_state_root(
+        env, claude_home, tmp_path, monkeypatch):
+    a = with_history(claude_home, tmp_path, "alpha", 1)
+    started = []
+
+    class Popen:
+        def __init__(self, cmd, **kw):
+            started.append((list(cmd), kw, getattr(kw.get("stdout"), "name", None),
+                            getattr(kw.get("stderr"), "name", None)))
+    monkeypatch.setattr(subprocess, "Popen", Popen)
+
+    history_all.spawn(hosts.ClaudeCode(), env, a)
+    assert len(started) == 1
+    cmd, kw, out, err = started[0]
+    i = cmd.index("history")
+    assert cmd[i:i + 4] == ["history", "import", "--all", "--auto"]
+    log = os.path.join(state_root(env), "history-all.log")
+    assert out == err == log and os.path.exists(log)
+    assert kw.get("cwd") == a
+    assert not os.path.exists(store_for(env, a).path("history.log"))
