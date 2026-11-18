@@ -29,10 +29,14 @@ são aprendidas depois, sessão importada nunca segura deny list.
 
 Novo módulo `tokeneconomizer/plugin/history_all.py`:
 
-- `discover(host, env, dirs)`: percorre `host.history(env, dirs)`, lê a cabeça de cada log
-  (`host.log_head`) para o `cwd` registrado, e agrupa por `repo_identity(cwd).key`. Para cada
-  grupo devolve `{key, label, cwd, sessions}` com um `cwd` que existe no disco. Grupo sem nenhum
-  `cwd` existente fica de fora (`skipped["gone"]`).
+- `discover(host, env, dirs)`: UMA varredura de `host.history(env, dirs)`, lendo a cabeça de
+  cada log (`host.log_head`) uma vez, e agrupa por repo com `history._identity` (cache de
+  `repo_identity`). Log cujo `cwd` não existe mais vai para o grupo do repo vivo cuja pasta do
+  Claude Code bate exatamente com a do log (a mesma regra de `history.is_this_repository`); sem
+  repo vivo, fica de fora (`skipped["gone"]`). Para cada grupo devolve `{key, label, cwd, logs}`,
+  com `cwd` existente e a lista de logs já com cabeça lida.
+- `history.plan` ganha um parâmetro opcional `logs` (a lista do grupo, com cabeça): com ele,
+  não varre o histórico de novo. Sem ele, comportamento atual.
 - Ordem: o repo da sessão que disparou primeiro, depois por número de sessões, decrescente;
   empate por `key`.
 - `run_all(host, env, first_cwd=None, budget_s)`: para cada grupo, monta
@@ -45,6 +49,7 @@ Novo módulo `tokeneconomizer/plugin/history_all.py`:
   "skipped": {why: n}, "started", "heartbeat", "finished", "pid"}`. Heartbeat parado por
   `HEARTBEAT_STALE_S` deixa a próxima sessão reiniciar. Gravação atômica com trava, como
   `history.json`.
+- Log do processo em `<state_root>/history-all.log` (não no store do repo que disparou).
 - `--dry-run`: imprime a fila (label, sessões, pasta) e o que fica de fora, sem gravar nada.
 
 `history.run` com `auto=True` precisa que `history.json` tenha sido marcado antes (é o que
@@ -76,8 +81,11 @@ distiller.
   `fold.fold_locked(..., imported=True, propose=...)`, que repassa para `_fold_microskills`.
 - Só com `microskills` num perfil pago (`icfg.paid`) e o sidecall não pausado; senão, cai no
   comportamento atual (só a camada gratuita).
-- Custo: os tokens do proposer entram no registro do ledger da sessão importada, como overhead,
-  e `te status` mostra o gasto do histórico separado.
+- Custo: os tokens do proposer entram no registro do ledger da sessão importada, como overhead
+  (já acontece em `fold.py:574-576`). `accounting.summarize` hoje descarta registros importados
+  antes de somar overhead (`accounting.py:41-43`): ganha uma soma separada
+  (`imported_overhead`), e `te status` mostra uma linha "history: N session(s) read, X tokens
+  spent reading them" quando for maior que zero.
 - As chamadas rodam em série, dentro do processo em segundo plano. As sessões do próprio
   proposer (`claude -p`) já ficam de fora do histórico pela regra `headless`.
 
@@ -109,3 +117,24 @@ docstrings de `history.py` e `config.py`. Sem alegação de efeito no texto do p
 Codex, Copilot e os outros agentes (o pedido é o `~/.claude`). Mudar as regras de confirmação
 dos fatos. Deny list de ferramentas aplicada sozinha a partir do histórico (continua esperando
 `toolprune apply`).
+
+## Decisões do grill
+
+- **A1** — micro-skills continua desligado por padrão no código; na instalação desta máquina
+  roda `config set microskills=on --global`. Motivo: o usuário quer o fork perto do original
+  para um PR possível.
+- **A2** — descartado. A retenção de 30 dias só limita o que existe hoje; depois de instalado,
+  o plugin aprende cada sessão ao terminar e não depende mais do histórico.
+- **A3** — confirma o disparo no primeiro `SessionStart`.
+- **A4** — soma separada do gasto importado em `accounting` e linha em `te status`. Motivo:
+  sem isso o custo prometido pela spec fica invisível.
+- **A5** — `discover` faz uma varredura só e passa os logs ao `plan` de cada repo. Motivo:
+  `plan` por repo leria as 1.074 cabeças umas 60 vezes.
+- **A6** — log de pasta sumida rota pelo nome da pasta do Claude Code, como no import por repo.
+  Motivo: não perder sessões de checkout movido.
+- **A7** — mantido: montar o contexto de cada repo faz a mesma adoção que a primeira sessão
+  faria; erro vira linha no log e o run segue.
+- **A8** — log do run global em `<state_root>/history-all.log`.
+- **A9, A10, A12** — confirmam a spec.
+- **A11** — testes que mudam: `test_history_import.py:204-220` (padrão) e `:608-624` (passa a
+  esperar chamadas só na cauda).
