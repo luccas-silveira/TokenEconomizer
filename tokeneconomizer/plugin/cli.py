@@ -270,6 +270,10 @@ def cmd_status(args):
           f"overhead {accounting.fmt_tokens(ledger['overhead_tokens'])} "
           f"({ledger['overhead_frac']:.1%})")
     hist = history.describe(out["history"], ctx.host.name)
+    if ledger["imported_overhead_tokens"]:
+        spent = (f"{accounting.fmt_tokens(ledger['imported_overhead_tokens'])} effective tokens "
+                 f"spent reading")
+        hist = f"{hist}; {spent} it" if hist else f"{spent} earlier history"
     if hist:
         print(f"  history      {hist}")
     i = out["microskills"]

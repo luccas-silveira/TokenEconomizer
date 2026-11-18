@@ -37,9 +37,11 @@ def summarize(records):
     """Aggregate ledger records into the numbers `te status` prints.
 
     A session imported from the agent's history (`imported: true`) ran before the plugin: it is
-    counted on its own (`imported_sessions`) and left out of every other number."""
+    counted on its own (`imported_sessions`) and left out of every other number. What the plugin
+    spent reading those sessions is `imported_overhead_tokens`, apart from `overhead_tokens`."""
     records = [r for r in records if isinstance(r, dict)]
     imported = [r for r in records if r.get("kind") == "session" and r.get("imported")]
+    imp_oh = sum(overhead_total(r.get("overhead")) for r in imported)
     records = [r for r in records if not r.get("imported")]
     sessions = [r for r in records if r.get("kind") == "session"]
     priced = [r for r in sessions if isinstance(r.get("effective_tokens"), (int, float))]
@@ -54,6 +56,7 @@ def summarize(records):
         "priced_sessions": len(priced),
         "effective_tokens": exec_total,
         "overhead_tokens": oh_total,
+        "imported_overhead_tokens": imp_oh,
         "overhead_frac": (oh_total / (exec_total + oh_total)) if (exec_total + oh_total) else 0.0,
         "requests": sum(int(r.get("requests") or 0) for r in sessions),
         "nudges": sum(int(r.get("nudges") or 0) for r in sessions),
