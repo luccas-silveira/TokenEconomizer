@@ -1042,3 +1042,83 @@ def test_the_notice_is_said_once_per_repository_after_the_whole_run_imported_it(
     other = start_hook(env, b, "b1", tmp_path)                 # read by the same run
     assert said.format(n=3, label=lb) in other["systemMessage"]
     assert "earlier session" not in start_hook(env, b, "b2", tmp_path).get("systemMessage", "")
+
+
+# ---- what the docs say about it ------------------------------------------------------------
+
+DOC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOCS = ("README.md", os.path.join("docs", "PLUGIN.md"), os.path.join("plugin", "README.md"))
+DOCSTRING_MODULES = ("config", "history", "controller")
+SAYS_OFF = re.compile(r"off by default|\(it is off\b|\bthis is off\b|default(?:s)? (?:is|to) off",
+                      re.IGNORECASE)
+
+
+def _doc(rel):
+    with open(os.path.join(DOC_ROOT, rel), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _module_docstring(name):
+    import ast
+    return ast.get_docstring(ast.parse(_doc(os.path.join("tokeneconomizer", "plugin",
+                                                         name + ".py")))) or ""
+
+
+def _chunks(text):
+    """Paragraphs, with each table row and each `  * ` list item a chunk of its own, so that a
+    neighbour's "off by default" (`droid_sidecall`'s, the repository map's) is not
+    `history_import`'s."""
+    out, cur = [], []
+    for line in text.splitlines():
+        own = line.lstrip().startswith(("|", "* ", "- "))
+        if not line.strip() or own:
+            if cur:
+                out.append("\n".join(cur))
+            cur = [line] if own else []
+            if own:
+                out.append(line)
+                cur = []
+            continue
+        cur.append(line)
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def _says_history_import_is_off(text):
+    return [c for c in _chunks(text) if "history_import" in c and SAYS_OFF.search(c)]
+
+
+@pytest.mark.parametrize("rel", DOCS)
+def test_no_doc_says_history_import_is_off_by_default(rel):
+    assert _says_history_import_is_off(_doc(rel)) == []
+
+
+@pytest.mark.parametrize("name", DOCSTRING_MODULES)
+def test_no_module_docstring_says_history_import_is_off_by_default(name):
+    assert _says_history_import_is_off(_module_docstring(name)) == []
+
+
+@pytest.mark.parametrize("rel", DOCS)
+def test_each_doc_names_te_history_import_all(rel):
+    assert "history import --all" in _doc(rel)
+
+
+@pytest.mark.parametrize("rel", DOCS)
+def test_each_doc_names_history_propose_sessions(rel):
+    assert "history_propose_sessions" in _doc(rel)
+
+
+def _settings_row(key):
+    rows = [ln for ln in _doc(os.path.join("plugin", "README.md")).splitlines()
+            if re.match(r"\|\s*`%s`\s*\|" % re.escape(key), ln)]
+    assert len(rows) == 1, f"{key}: {rows}"
+    return [c.strip() for c in rows[0].strip().strip("|").split("|")]
+
+
+def test_the_settings_table_lists_history_propose_sessions_with_default_12():
+    assert _settings_row("history_propose_sessions")[1] == "`12`"
+
+
+def test_the_settings_table_lists_history_import_on_by_default():
+    assert _settings_row("history_import")[1] == "`true`"
